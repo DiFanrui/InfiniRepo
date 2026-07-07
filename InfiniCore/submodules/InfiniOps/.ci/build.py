@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""CI image builder: detect changes, build, tag, and optionally push Docker images."""
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+from utils import get_git_commit, load_config
+
+CI_DIR = Path(__file__).resolve().parent
+
+
+def shell_join(args):
+    """Return a shell-escaped command string on Python versions before shlex.join."""
+    return " ".join(shlex.quote(str(arg)) for arg in args)
+
+
+def has_dockerfile_changed(dockerfile_dir, base_ref="HEAD~1"):
+    """Check if any file under `dockerfile_dir` changed since `base_ref`."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", base_ref, "--", dockerfile_dir],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print(
+            "warning: git diff failed (shallow clone or initial commit?);"
+            " assuming Dockerfile changed",
+            file=sys.stderr,
+        )
+        return True
+
+    return bool(result.stdout.strip())
+
+
+def docker_login(registry_cfg, dry_run):
+    """Log in to the registry using `credentials_env` token.
+
+    Returns True on success.
+
+    NOTE: Registry support is currently unused (`config.yml` has no registry
+    section). Retained for future integration with an external image management
+    system.
+    """
+    credentials_env = registry_cfg.get("credentials_env")
+    registry_url = registry_cfg.get("url", "")
+
+    if not credentials_env or not registry_url:
+        return True
+
+    token = os.environ.get(credentials_env)
+
+    if not token:
+        print(
+            f"error: {credentials_env} not set, cannot login",
+            file=sys.stderr,
+        )
+        return False
+
+    if dry_run:
+        print(
+            f"[dry-run] echo <token> | docker login {registry_url}"
+            " --username token --password-stdin"
+        )
+        return True
+
+    result = subprocess.run(
+        ["docker", "login", registry_url, "--username", "token", "--password-stdin"],
+        input=token,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print("error: docker login failed", file=sys.stderr)
+        return False
+
+    return True
+
+
+def build_image_tag(registry_url, project, platform, tag):
+    if registry_url:
+        return f"{registry_url}/{project}/{platform}:{tag}"
+
+    return f"{project}-ci/{platform}:{tag}"
+
+
+def hash_file(hasher, root, path):
+    rel = path.relative_to(root).as_posix()
+    hasher.update(rel.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(path.read_bytes())
+    hasher.update(b"\0")
+
+
+def build_context_fingerprint(dockerfile_dir, platform_cfg):
+    """Return a stable digest for the Docker build inputs that define an image."""
+    root = Path(dockerfile_dir)
+    hasher = hashlib.sha256()
+
+    hasher.update(b"infiniops-ci-image-v1\0")
+
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        hash_file(hasher, root, path)
+
+    image_cfg = {
+        "build_args": platform_cfg.get("build_args", {}),
+        "buildkit": bool(platform_cfg.get("buildkit")),
+        "private_sdk": platform_cfg.get("private_sdk", {}),
+        "skip_build": bool(platform_cfg.get("skip_build")),
+        "source_image": platform_cfg.get("source_image", ""),
+    }
+    private_sdk = platform_cfg.get("private_sdk", {})
+    source_env = private_sdk.get("source_env", "")
+    if source_env:
+        image_cfg["private_sdk_url_sha256"] = hashlib.sha256(
+            os.environ.get(source_env, "").encode("utf-8")
+        ).hexdigest()
+
+    hasher.update(json.dumps(image_cfg, sort_keys=True).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def build_content_tag(dockerfile_dir, platform_cfg, length=12):
+    return f"df-{build_context_fingerprint(dockerfile_dir, platform_cfg)[:length]}"
+
+
+def image_exists(tag):
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", tag],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def resolve_dockerfile_dir(dockerfile_dir):
+    """Resolve Dockerfile directories from caller or CI-tool relative paths."""
+    path = Path(dockerfile_dir)
+
+    if path.is_dir():
+        return str(path)
+
+    tool_path = CI_DIR / dockerfile_dir
+
+    if tool_path.is_dir():
+        return str(tool_path)
+
+    return str(path)
+
+
+def build_image(
+    platform,
+    platform_cfg,
+    registry_cfg,
+    commit,
+    push,
+    dry_run,
+    logged_in,
+    reuse_existing=False,
+):
+    """Build a single platform image. Returns True on success."""
+    registry_url = registry_cfg.get("url", "")
+    project = registry_cfg.get("project", "infiniops")
+    commit_tag = build_image_tag(registry_url, project, platform, commit)
+    latest_tag = build_image_tag(registry_url, project, platform, "latest")
+    build_args_cfg = platform_cfg.get("build_args", {})
+
+    if reuse_existing:
+        if dry_run:
+            print(f"[dry-run] docker image inspect {commit_tag}")
+        elif image_exists(commit_tag):
+            print(f"==> {platform}: reusing existing image {commit_tag}", file=sys.stderr)
+            tag_latest = subprocess.run(["docker", "tag", commit_tag, latest_tag])
+            return tag_latest.returncode == 0
+
+    if platform_cfg.get("skip_build"):
+        source_image = platform_cfg.get("source_image") or build_args_cfg.get("BASE_IMAGE")
+
+        if not source_image:
+            print(
+                f"error: skip_build for {platform} requires source_image or build_args.BASE_IMAGE",
+                file=sys.stderr,
+            )
+            return False
+
+        tag_cmds = [
+            ["docker", "tag", source_image, commit_tag],
+            ["docker", "tag", source_image, latest_tag],
+        ]
+
+        if dry_run:
+            for cmd in tag_cmds:
+                print(f"[dry-run] {shell_join(cmd)}")
+            return True
+
+        print(f"==> tagging {platform}: {source_image} -> {commit_tag}", file=sys.stderr)
+
+        inspect_result = subprocess.run(
+            ["docker", "image", "inspect", source_image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        if inspect_result.returncode != 0:
+            pull_result = subprocess.run(["docker", "pull", source_image])
+
+            if pull_result.returncode != 0:
+                error = {
+                    "stage": "pull",
+                    "platform": platform,
+                    "source": source_image,
+                    "exit_code": pull_result.returncode,
+                }
+                print(json.dumps(error), file=sys.stderr)
+                return False
+
+        for cmd in tag_cmds:
+            result = subprocess.run(cmd)
+
+            if result.returncode != 0:
+                error = {
+                    "stage": "tag",
+                    "platform": platform,
+                    "source": source_image,
+                    "tag": commit_tag,
+                    "exit_code": result.returncode,
+                }
+                print(json.dumps(error), file=sys.stderr)
+                return False
+
+        return True
+
+    dockerfile_dir = resolve_dockerfile_dir(platform_cfg["dockerfile"])
+    build_cmd = ["docker", "build", "--network", "host"]
+
+    for key, value in build_args_cfg.items():
+        build_cmd.extend(["--build-arg", f"{key}={value}"])
+
+    for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        proxy_val = os.environ.get(proxy_var) or os.environ.get(proxy_var.lower())
+
+        if proxy_val:
+            build_cmd.extend(["--build-arg", f"{proxy_var}={proxy_val}"])
+            build_cmd.extend(["--build-arg", f"{proxy_var.lower()}={proxy_val}"])
+
+    private_sdk = platform_cfg.get("private_sdk", {})
+
+    if private_sdk:
+        source_env = private_sdk.get("source_env", "")
+        sdk_url = os.environ.get(source_env, "") if source_env else ""
+
+        if sdk_url:
+            build_cmd.extend(["--build-arg", f"PRIVATE_SDK_URL={sdk_url}"])
+
+    build_cmd.extend(["-t", commit_tag, "-t", latest_tag, dockerfile_dir])
+
+    if dry_run:
+        print(f"[dry-run] {shell_join(build_cmd)}")
+
+        if push:
+            if not logged_in:
+                print("[dry-run] (skipping push: docker login failed)")
+            else:
+                print(f"[dry-run] docker push {commit_tag}")
+                print(f"[dry-run] docker push {latest_tag}")
+
+        return True
+
+    print(f"==> building {platform}: {commit_tag}", file=sys.stderr)
+    build_env = os.environ.copy()
+    if platform_cfg.get("buildkit"):
+        build_env.setdefault("DOCKER_BUILDKIT", "1")
+        build_env.setdefault("BUILDKIT_PROGRESS", "plain")
+    result = subprocess.run(build_cmd, env=build_env)
+
+    if result.returncode != 0:
+        error = {
+            "stage": "build",
+            "platform": platform,
+            "tag": commit_tag,
+            "exit_code": result.returncode,
+        }
+        print(json.dumps(error), file=sys.stderr)
+
+        return False
+
+    if push:
+        if not logged_in:
+            print("error: docker login failed, cannot push", file=sys.stderr)
+            return False
+
+        for tag in (commit_tag, latest_tag):
+            print(f"==> pushing {tag}", file=sys.stderr)
+            push_result = subprocess.run(["docker", "push", tag])
+
+            if push_result.returncode != 0:
+                error = {
+                    "stage": "push",
+                    "platform": platform,
+                    "tag": tag,
+                    "exit_code": push_result.returncode,
+                }
+                print(json.dumps(error), file=sys.stderr)
+
+                return False
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build CI Docker images")
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default="all",
+        help=(
+            "Platform to build: nvidia, iluvatar, metax, moore, cambricon, "
+            "ascend, or all (default: all)"
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "config.yml",
+        help="Path to config.yml",
+    )
+    parser.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help="Git ref or tag string for the image; omit to use current HEAD (short SHA)",
+    )
+    parser.add_argument(
+        "--tag-mode",
+        choices=("commit", "content"),
+        default="commit",
+        help="Use the git commit tag or a Dockerfile content tag (default: commit)",
+    )
+    parser.add_argument(
+        "--print-tag",
+        action="store_true",
+        help="Print the resolved image tag string for the selected platform and exit",
+    )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Skip docker build when the resolved image tag already exists locally",
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="Push images to registry after building (requires registry in config)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip change detection and force build",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    registry_cfg = config.get("registry", {})
+    images_cfg = config.get("images", {})
+
+    if not images_cfg:
+        print("error: no `images` section in config", file=sys.stderr)
+        sys.exit(1)
+
+    if args.platform == "all":
+        platforms = list(images_cfg.keys())
+    else:
+        if args.platform not in images_cfg:
+            print(
+                f"error: platform `{args.platform}` not found in config",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        platforms = [args.platform]
+
+    if args.print_tag and args.platform == "all":
+        print("error: --print-tag requires a single --platform", file=sys.stderr)
+        sys.exit(1)
+
+    commit = args.commit if args.commit is not None else get_git_commit()
+    logged_in = docker_login(registry_cfg, args.dry_run) if args.push else True
+    failed = False
+
+    for platform in platforms:
+        platform_cfg = images_cfg[platform]
+        dockerfile_dir = resolve_dockerfile_dir(platform_cfg["dockerfile"])
+
+        if not Path(dockerfile_dir).is_dir():
+            print(
+                f"warning: dockerfile directory `{dockerfile_dir}` does not exist,"
+                f" skipping {platform}",
+                file=sys.stderr,
+            )
+            continue
+
+        image_tag = (
+            build_content_tag(dockerfile_dir, platform_cfg)
+            if args.tag_mode == "content"
+            else commit
+        )
+
+        if args.print_tag:
+            print(image_tag)
+            continue
+
+        if not args.force and not has_dockerfile_changed(dockerfile_dir):
+            print(f"==> {platform}: no changes detected, skipping", file=sys.stderr)
+            continue
+
+        ok = build_image(
+            platform,
+            platform_cfg,
+            registry_cfg,
+            image_tag,
+            args.push,
+            args.dry_run,
+            logged_in=logged_in,
+            reuse_existing=args.reuse_existing,
+        )
+
+        if not ok:
+            failed = True
+
+    if failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

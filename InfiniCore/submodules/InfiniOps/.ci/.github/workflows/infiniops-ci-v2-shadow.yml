@@ -1,0 +1,431 @@
+name: InfiniOps CI v2 Shadow
+
+permissions:
+  actions: read
+  contents: read
+
+on:
+  workflow_call:
+    secrets:
+      CI_RUNNER_STATUS_TOKEN:
+        description: "Token allowed to list self-hosted runners for preflight checks"
+        required: false
+    inputs:
+      config_path:
+        description: "Path to the caller repository CI config"
+        required: false
+        type: string
+        default: ".github/ci_config.yml"
+      ci_ref:
+        description: "Commit SHA of InfiniTensor/ci to use for CI tooling"
+        required: true
+        type: string
+      platform:
+        description: "Platform to run, or 'all' for every configured agent_local platform"
+        required: false
+        type: string
+        default: "all"
+      max_parallel:
+        description: "Maximum parallel shadow jobs"
+        required: false
+        type: number
+        default: 10
+
+jobs:
+  prepare:
+    name: Generate CI v2 shadow matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json_for_unittest: ${{ steps.generate.outputs.matrix_json_for_unittest }}
+      job_types_with_jobs: ${{ steps.generate.outputs.job_types_with_jobs }}
+    steps:
+      - name: Checkout caller repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf repo
+          mkdir -p repo
+          cd repo
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --prune --no-recurse-submodules --depth=1 origin "${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+          git config --local gc.auto 0
+          git config --global --add safe.directory "${PWD}"
+
+      - name: Checkout CI tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf repo/.ci
+          mkdir -p repo/.ci
+          cd repo/.ci
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/InfiniTensor/ci.git"
+          git fetch --no-tags --prune --no-recurse-submodules --depth=1 origin "${{ inputs.ci_ref }}"
+          git checkout --force FETCH_HEAD
+          git config --local gc.auto 0
+          git config --global --add safe.directory "${PWD}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install converter dependency
+        run: python -m pip install pyyaml
+
+      - name: Convert config to CI v2 shadow matrix JSON
+        id: generate
+        working-directory: repo
+        run: >
+          python .ci/config_to_matrix.py
+          --config "${{ inputs.config_path }}"
+          --platform "${{ inputs.platform }}"
+          --execution-mode agent_local
+          --require-runner-label
+          --write-github-outputs
+
+      - name: Preflight self-hosted runner availability
+        env:
+          RUNNER_STATUS_TOKEN: ${{ secrets.CI_RUNNER_STATUS_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          MATRIX_JSON: ${{ steps.generate.outputs.matrix_json_for_unittest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          matrix_text = os.environ.get("MATRIX_JSON", "").strip()
+          if not matrix_text:
+              print("No unittest matrix; skipping runner availability preflight.")
+              sys.exit(0)
+
+          token = os.environ.get("RUNNER_STATUS_TOKEN", "").strip()
+          if not token:
+              print(
+                  "CI_RUNNER_STATUS_TOKEN is not configured; skipping preflight runner availability check."
+              )
+              print("GitHub Actions will keep matching jobs queued until a runner is available.")
+              sys.exit(0)
+          repo = os.environ["REPOSITORY"]
+          matrix = json.loads(matrix_text)
+          expected = {}
+          for entry in matrix.get("include", []):
+              platform = str(entry.get("platform", "")).strip()
+              label = str(entry.get("runner_label", "")).strip()
+              if platform and label:
+                  expected[platform] = label
+
+          runners = []
+          url = f"https://api.github.com/repos/{repo}/actions/runners?per_page=100"
+          try:
+            while url:
+              req = urllib.request.Request(url)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  payload = json.load(resp)
+                  runners.extend(payload.get("runners", []))
+                  link = resp.headers.get("Link", "")
+
+              next_url = ""
+              for part in link.split(","):
+                  if 'rel="next"' in part:
+                      next_url = part[part.find("<") + 1 : part.find(">")]
+                      break
+              url = next_url
+          except urllib.error.HTTPError as exc:
+              if exc.code == 403:
+                  print("Runner availability preflight cannot list self-hosted runners.", file=sys.stderr)
+                  print(
+                      "Secret CI_RUNNER_STATUS_TOKEN exists but cannot list repository self-hosted runners; "
+                      "skipping preflight runner availability check.",
+                      file=sys.stderr,
+                  )
+                  print("GitHub Actions will keep matching jobs queued until a runner is available.")
+                  sys.exit(0)
+              raise
+
+          def runner_has_label(runner, label):
+              return any(item.get("name") == label for item in runner.get("labels", []))
+
+          def has_registered_runner(label):
+              for runner in runners:
+                  if runner_has_label(runner, label):
+                      return True
+              return False
+
+          def has_online_runner(label):
+              for runner in runners:
+                  if runner.get("status") == "online" and runner_has_label(runner, label):
+                      return True
+              return False
+
+          unregistered = [
+              (platform, label)
+              for platform, label in expected.items()
+              if not has_registered_runner(label)
+          ]
+          if unregistered:
+              print("No registered self-hosted runner label before starting CI v2 jobs:", file=sys.stderr)
+              for platform, label in unregistered:
+                  print(f"- job=run-unittest-shadow platform={platform} runner_label={label}", file=sys.stderr)
+              sys.exit(1)
+
+          offline = [
+              (platform, label)
+              for platform, label in expected.items()
+              if not has_online_runner(label)
+          ]
+          if offline:
+              print(
+                  "No online self-hosted runner currently available; matching CI v2 jobs will remain queued:",
+                  file=sys.stderr,
+              )
+              for platform, label in offline:
+                  print(f"- job=run-unittest-shadow platform={platform} runner_label={label}", file=sys.stderr)
+              sys.exit(0)
+
+          print("All required self-hosted runner labels have at least one online runner.")
+          PY
+
+  run-unittest-shadow:
+    name: ci-v2-shadow / ${{ matrix.platform }}
+    needs: prepare
+    if: contains(fromJSON(needs.prepare.outputs.job_types_with_jobs), 'unittest')
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix_json_for_unittest) }}
+    runs-on:
+      - self-hosted
+      - linux
+      - ${{ matrix.runner_label }}
+    timeout-minutes: ${{ matrix.shadow_timeout_minutes }}
+    steps:
+      - name: Checkout caller repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf repo
+          mkdir -p repo
+          cd repo
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --prune --no-recurse-submodules --depth=1 origin "${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+          git config --local gc.auto 0
+          git config --global --add safe.directory "${PWD}"
+
+      - name: Checkout CI tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf repo/.ci
+          mkdir -p repo/.ci
+          cd repo/.ci
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/InfiniTensor/ci.git"
+          git fetch --no-tags --prune --no-recurse-submodules --depth=1 origin "${{ inputs.ci_ref }}"
+          git checkout --force FETCH_HEAD
+          git config --local gc.auto 0
+          git config --global --add safe.directory "${PWD}"
+
+      - name: Resolve image tag
+        working-directory: repo
+        run: |
+          IMAGE_TAG_VALUE="$(python3 .ci/build.py \
+            --config "${{ inputs.config_path }}" \
+            --platform "${{ matrix.platform }}" \
+            --tag-mode content \
+            --print-tag)"
+          echo "IMAGE_TAG_VALUE=${IMAGE_TAG_VALUE}" >> "$GITHUB_ENV"
+          echo "Using image tag: ${IMAGE_TAG_VALUE}"
+
+      - name: Build image
+        working-directory: repo
+        run: |
+          python3 .ci/build.py \
+            --config "${{ inputs.config_path }}" \
+            --platform "${{ matrix.platform }}" \
+            --tag-mode content \
+            --reuse-existing \
+            --force
+
+      - name: Check local CI agent
+        id: agent
+        working-directory: repo
+        env:
+          OUT_DIR: ci-v2-artifacts/${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          available=false
+          reason=""
+          state_dir="${RUNNER_TEMP:-/tmp}/ci-agent-state-${GITHUB_RUN_ID}-${{ matrix.id }}"
+
+          state_dir_usable() {
+            local candidate="$1"
+            mkdir -p "${candidate}/tasks" "${candidate}/logs" "${candidate}/locks" 2>/dev/null || return 1
+            [ -w "${candidate}" ] && [ -w "${candidate}/tasks" ] && [ -w "${candidate}/logs" ] && [ -w "${candidate}/locks" ] || return 1
+            local probe="${candidate}/locks/${{ matrix.platform }}.lock"
+            : >> "${probe}" 2>/dev/null || return 1
+          }
+
+          if ! state_dir_usable "${state_dir}"; then
+            reason="state_dir_unwritable"
+          fi
+
+          if [ -n "${reason}" ]; then
+            available=false
+          else
+            daemon_log="${RUNNER_TEMP:-/tmp}/ci-agent-${GITHUB_RUN_ID}-${{ matrix.id }}.log"
+            nohup python3 .ci/ci_agent.py --state-dir "${state_dir}" daemon --poll-interval 5 >"${daemon_log}" 2>&1 &
+            daemon_pid="$!"
+            sleep 2
+            if kill -0 "${daemon_pid}" 2>/dev/null; then
+              available=true
+              echo "started transient ci-agent daemon with state dir ${state_dir}, log: ${daemon_log}"
+            else
+              reason="daemon_not_running"
+              cat "${daemon_log}" || true
+            fi
+          fi
+
+          echo "available=${available}" >> "${GITHUB_OUTPUT}"
+          echo "state_dir=${state_dir}" >> "${GITHUB_OUTPUT}"
+          if [ "${available}" = "true" ]; then
+            exit 0
+          fi
+
+          mkdir -p "${OUT_DIR}"
+          python3 - "${OUT_DIR}/task.json" "${reason}" <<'PY'
+          import json
+          import os
+          import sys
+
+          path, reason = sys.argv[1], sys.argv[2]
+          task = {
+              "id": os.environ.get("GITHUB_RUN_ID", ""),
+              "platform": "${{ matrix.platform }}",
+              "job": "${{ matrix.id }}",
+              "status": "agent_unavailable",
+              "reason": reason,
+          }
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(task, f, indent=2, sort_keys=True)
+              f.write("\n")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write(f"### CI v2 shadow: {task['platform']} / {task['job']}\n\n")
+                  f.write("- status: `agent_unavailable`\n")
+                  f.write(f"- reason: `{reason}`\n")
+          PY
+
+      - name: Submit CI v2 shadow task
+        id: submit
+        if: steps.agent.outputs.available == 'true'
+        working-directory: repo
+        env:
+          TASK_ID: ${{ github.run_id }}-${{ matrix.id }}
+          CI_AGENT_STATE_DIR: ${{ steps.agent.outputs.state_dir }}
+          RESULT_DIR: ${{ github.workspace }}/repo/ci-v2-results/${{ github.run_id }}-${{ matrix.id }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          JOB_ID: ${{ matrix.id }}
+          QUEUE_TIMEOUT: ${{ matrix.queue_timeout }}
+          GPU_IDS: ${{ matrix.gpu_ids }}
+          NGPU: ${{ matrix.ngpus }}
+          MEMORY: ${{ matrix.memory }}
+          JUNIT_PATH: ${{ matrix.junit_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULT_DIR}"
+          command="PYTHONDONTWRITEBYTECODE=1 python3 .ci/run.py --config '${CONFIG_PATH}' --platform '${{ matrix.platform }}' --job '${JOB_ID}' --local --image-tag '${IMAGE_TAG_VALUE}' --results-dir '${RESULT_DIR}'"
+          task_id="$(python3 .ci/ci_agent.py submit \
+            --id "${TASK_ID}" \
+            --platform "${{ matrix.platform }}" \
+            --job "${JOB_ID}" \
+            --workdir "${PWD}" \
+            --command "${command}" \
+            --result-dir "${RESULT_DIR}" \
+            --junit-path "${JUNIT_PATH}" \
+            --queue-timeout "${QUEUE_TIMEOUT}" \
+            --gpu-ids "${GPU_IDS}" \
+            --ngpus "${NGPU:-0}" \
+            --memory "${MEMORY}")"
+          echo "task_id=${task_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Wait for CI v2 shadow task
+        id: wait
+        if: steps.agent.outputs.available == 'true'
+        continue-on-error: true
+        working-directory: repo
+        env:
+          CI_AGENT_STATE_DIR: ${{ steps.agent.outputs.state_dir }}
+          TASK_ID: ${{ steps.submit.outputs.task_id }}
+        run: |
+          set -euo pipefail
+          trap 'python3 .ci/ci_agent.py cancel "${TASK_ID}"' INT TERM
+          python3 .ci/ci_agent.py wait "${TASK_ID}" --poll-interval 5
+
+      - name: Collect CI v2 shadow artifacts
+        if: always() && steps.agent.outputs.available == 'true'
+        working-directory: repo
+        env:
+          CI_AGENT_STATE_DIR: ${{ steps.agent.outputs.state_dir }}
+          TASK_ID: ${{ steps.submit.outputs.task_id }}
+          OUT_DIR: ci-v2-artifacts/${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          python3 .ci/ci_agent.py collect "${TASK_ID}" --output-dir "${OUT_DIR}"
+          python3 - "${OUT_DIR}/task.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          task = json.load(open(sys.argv[1], encoding="utf-8"))
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write(f"### CI v2 shadow: {task.get('platform')} / {task.get('job')}\n\n")
+                  f.write(f"- task: `{task.get('id')}`\n")
+                  f.write(f"- status: `{task.get('status')}`\n")
+                  f.write(f"- exit_code: `{task.get('exit_code', '')}`\n")
+                  result = task.get("result") or {}
+                  if result.get("reason"):
+                      f.write(f"- reason: `{result.get('reason')}`\n")
+                  if result.get("junit"):
+                      f.write(f"- junit: `{result.get('junit')}`\n")
+          PY
+
+      - name: Upload CI v2 shadow artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-v2-shadow-${{ matrix.id }}
+          path: repo/ci-v2-artifacts/${{ matrix.id }}
+
+      - name: Fail failed CI v2 shadow task
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.agent.outputs.available }}" != "true" ]; then
+            echo "CI v2 agent is unavailable on ${{ matrix.platform }}"
+            exit 1
+          fi
+          if [ "${{ steps.wait.outcome }}" != "success" ]; then
+            echo "CI v2 task failed on ${{ matrix.platform }}"
+            exit 1
+          fi

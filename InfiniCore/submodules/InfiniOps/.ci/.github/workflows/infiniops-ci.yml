@@ -1,0 +1,472 @@
+name: InfiniOps Reusable CI
+
+permissions:
+  actions: read
+  contents: read
+
+on:
+  workflow_call:
+    secrets:
+      CI_RUNNER_STATUS_TOKEN:
+        description: "Token allowed to list self-hosted runners for preflight checks"
+        required: false
+    inputs:
+      config_path:
+        description: "Path to the caller repository CI config"
+        required: false
+        type: string
+        default: ".github/ci_config.yml"
+      ci_ref:
+        description: "Ref of InfiniTensor/ci to use for CI tooling"
+        required: false
+        type: string
+        default: "codex/prune-unused-ci-artifacts"
+      platform:
+        description: "Platform to run, or 'all' for every configured platform"
+        required: false
+        type: string
+        default: "all"
+      max_parallel:
+        description: "Maximum parallel matrix jobs per job type"
+        required: false
+        type: number
+        default: 5
+
+jobs:
+  prepare:
+    name: Generate matrix from config
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json_for_unittest: ${{ steps.generate.outputs.matrix_json_for_unittest }}
+      job_types_with_jobs: ${{ steps.generate.outputs.job_types_with_jobs }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          submodules: false
+
+      - name: Replace caller .ci with CI tools
+        run: rm -rf repo/.ci
+
+      - name: Checkout CI tools
+        uses: actions/checkout@v4
+        with:
+          repository: InfiniTensor/ci
+          ref: ${{ inputs.ci_ref }}
+          path: repo/.ci
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install converter dependency
+        run: python -m pip install pyyaml
+
+      - name: Convert config to matrix JSON
+        id: generate
+        working-directory: repo
+        run: python .ci/config_to_matrix.py --config "${{ inputs.config_path }}" --platform "${{ inputs.platform }}" --write-github-outputs
+
+      - name: Preflight self-hosted runner availability
+        env:
+          RUNNER_STATUS_TOKEN: ${{ secrets.CI_RUNNER_STATUS_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          MATRIX_JSON: ${{ steps.generate.outputs.matrix_json_for_unittest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          matrix_text = os.environ.get("MATRIX_JSON", "").strip()
+          if not matrix_text:
+              print("No unittest matrix; skipping runner availability preflight.")
+              sys.exit(0)
+
+          token = os.environ.get("RUNNER_STATUS_TOKEN", "").strip()
+          if not token:
+              print(
+                  "CI_RUNNER_STATUS_TOKEN is not configured; skipping preflight runner availability check."
+              )
+              print("GitHub Actions will keep matching jobs queued until a runner is available.")
+              sys.exit(0)
+          repo = os.environ["REPOSITORY"]
+          matrix = json.loads(matrix_text)
+          expected = {}
+          for entry in matrix.get("include", []):
+              platform = str(entry.get("platform", "")).strip()
+              label = str(entry.get("runner_label", "")).strip()
+              if platform and label:
+                  expected[platform] = label
+
+          runners = []
+          url = f"https://api.github.com/repos/{repo}/actions/runners?per_page=100"
+          try:
+            while url:
+              req = urllib.request.Request(url)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  payload = json.load(resp)
+                  runners.extend(payload.get("runners", []))
+                  link = resp.headers.get("Link", "")
+
+              next_url = ""
+              for part in link.split(","):
+                  if 'rel="next"' in part:
+                      next_url = part[part.find("<") + 1 : part.find(">")]
+                      break
+              url = next_url
+          except urllib.error.HTTPError as exc:
+              if exc.code == 403:
+                  print("Runner availability preflight cannot list self-hosted runners.", file=sys.stderr)
+                  print(
+                      "Secret CI_RUNNER_STATUS_TOKEN exists but cannot list repository self-hosted runners; "
+                      "skipping preflight runner availability check.",
+                      file=sys.stderr,
+                  )
+                  print("GitHub Actions will keep matching jobs queued until a runner is available.")
+                  sys.exit(0)
+              raise
+
+          def runner_has_label(runner, label):
+              return any(item.get("name") == label for item in runner.get("labels", []))
+
+          def has_registered_runner(label):
+              for runner in runners:
+                  if runner_has_label(runner, label):
+                      return True
+              return False
+
+          def has_online_runner(label):
+              for runner in runners:
+                  if runner.get("status") == "online" and runner_has_label(runner, label):
+                      return True
+              return False
+
+          unregistered = [
+              (platform, label)
+              for platform, label in expected.items()
+              if not has_registered_runner(label)
+          ]
+          if unregistered:
+              print("No registered self-hosted runner label before starting CI jobs:", file=sys.stderr)
+              for platform, label in unregistered:
+                  print(f"- job=run-unittest platform={platform} runner_label={label}", file=sys.stderr)
+              sys.exit(1)
+
+          offline = [
+              (platform, label)
+              for platform, label in expected.items()
+              if not has_online_runner(label)
+          ]
+          if offline:
+              print(
+                  "No online self-hosted runner currently available; matching CI jobs will remain queued:",
+                  file=sys.stderr,
+              )
+              for platform, label in offline:
+                  print(f"- job=run-unittest platform={platform} runner_label={label}", file=sys.stderr)
+              sys.exit(0)
+
+          print("All required self-hosted runner labels have at least one online runner.")
+          PY
+
+      - name: Show generated job types
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          JOB_TYPES_WITH_JOBS: ${{ steps.generate.outputs.job_types_with_jobs }}
+        run: |
+          printf 'platform=%s\n' "${PLATFORM}"
+          printf 'job_types_with_jobs=%s\n' "${JOB_TYPES_WITH_JOBS}"
+
+  run-unittest:
+    name: unit / ${{ matrix.platform }}
+    needs: prepare
+    if: contains(fromJSON(needs.prepare.outputs.job_types_with_jobs), 'unittest')
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix_json_for_unittest) }}
+    runs-on:
+      - self-hosted
+      - linux
+      - ${{ matrix.runner_label }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          submodules: false
+
+      - name: Replace caller .ci with CI tools
+        run: rm -rf repo/.ci
+
+      - name: Checkout CI tools
+        uses: actions/checkout@v4
+        with:
+          repository: InfiniTensor/ci
+          ref: ${{ inputs.ci_ref }}
+          path: repo/.ci
+
+      - name: Resolve image tag
+        working-directory: repo
+        run: |
+          IMAGE_TAG_VALUE="$(python3 .ci/build.py \
+            --config "${{ inputs.config_path }}" \
+            --platform "${{ matrix.platform }}" \
+            --tag-mode content \
+            --print-tag)"
+          echo "IMAGE_TAG_VALUE=${IMAGE_TAG_VALUE}" >> "$GITHUB_ENV"
+          echo "Using image tag: ${IMAGE_TAG_VALUE}"
+
+      - name: Install CI dependency
+        working-directory: repo
+        if: ${{ matrix.platform == 'cambricon' }}
+        run: python3 -m pip install pyyaml
+
+      - name: Show stage plan
+        env:
+          MATRIX_JSON: ${{ needs.prepare.outputs.matrix_json_for_unittest }}
+          CURRENT_JOB: ${{ matrix.id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["MATRIX_JSON"])
+          current = os.environ["CURRENT_JOB"]
+          entry = next((x for x in data.get("include", []) if x.get("id") == current), None)
+          if not entry:
+              print(f"[warn] matrix entry not found for {current}")
+              raise SystemExit(0)
+
+          test_cmd = entry.get("test_cmd", "")
+          text = "\n".join([
+              f"job: {entry.get('id')}",
+              f"platform: {entry.get('platform')}",
+              "stage order:",
+              "  1) setup",
+              f"  2) test -> {test_cmd}",
+          ])
+          print(text)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write("### Stage plan\n\n```\n")
+                  f.write(text)
+                  f.write("\n```\n\n")
+          PY
+
+      - name: Build image
+        working-directory: repo
+        run: |
+          python3 .ci/build.py \
+            --config "${{ inputs.config_path }}" \
+            --platform "${{ matrix.platform }}" \
+            --tag-mode content \
+            --reuse-existing \
+            --force
+
+      - name: Prepare docker args and write GITHUB_ENV
+        working-directory: repo
+        env:
+          CONFIG: ${{ inputs.config_path }}
+          BRANCH: None
+          STAGE: None
+          IMAGE_TAG: "${{ env.IMAGE_TAG_VALUE }}"
+          GPU_ID: None
+          RESULT_DIR: None
+          TEST: None
+          LOCAL: True
+          EXECUTION_MODE: ${{ matrix.execution_mode }}
+        run: |
+          PYTHONPATH=.ci python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from run import (
+              apply_test_override,
+              build_docker_args,
+              build_results_dir,
+              resolve_image,
+              shell_join,
+          )
+          from ci_resource import ResourcePool, parse_gpu_requirement, parse_memory_requirement
+          from utils import get_git_commit, load_config
+
+          def env_opt(key):
+              v = os.environ.get(key, "")
+              return None if not v or v == "None" else v
+
+          config = load_config(Path(os.environ["CONFIG"]))
+          repo = config.get("repo", {})
+          repo_url = repo.get("url", "https://github.com/InfiniTensor/InfiniOps.git")
+          branch = env_opt("BRANCH") or repo.get("branch", "master")
+          platform = "${{ matrix.platform }}"
+          job_key = "${{ matrix.id }}"
+
+          jobs = config.get("jobs", {})
+          if job_key not in jobs:
+              print(f"error: job {job_key!r} not in config", file=sys.stderr)
+              sys.exit(1)
+
+          job = jobs[job_key]
+          all_stages = job.get("stages", [])
+          stage_filter = env_opt("STAGE")
+          stages = [s for s in all_stages if s["name"] == stage_filter] if stage_filter else all_stages
+
+          if stage_filter and not stages:
+              print(f"error: stage {stage_filter!r} not found in {job_key}", file=sys.stderr)
+              sys.exit(1)
+
+          test_override = env_opt("TEST")
+          if test_override:
+              stages = [{**s, "run": apply_test_override(s.get("run", ""), test_override)} for s in stages]
+
+          commit = get_git_commit()
+          results_base = Path(env_opt("RESULT_DIR") or "ci-results")
+          results_dir = build_results_dir(results_base, platform, stages, commit)
+          uses_local_runner = env_opt("EXECUTION_MODE") == "agent_local"
+          gpu_id_override = env_opt("GPU_ID")
+
+          if not uses_local_runner:
+              if not gpu_id_override:
+                  gpu_id_override = "all"
+
+              raw_gpu_ids = str(job.get("resources", {}).get("gpu_ids", "auto")).strip()
+              if not gpu_id_override and raw_gpu_ids == "auto":
+                  pool = ResourcePool(platform)
+                  gpu_count = parse_gpu_requirement(job)
+                  memory_mb = parse_memory_requirement(job)
+                  allocated_ids, ok = pool.allocate(gpu_count, memory_mb)
+
+                  if not ok:
+                      detected = pool.detect_gpus()
+                      print(
+                          f"error: cannot allocate {gpu_count} GPU(s) for {job_key}; "
+                          f"detected={detected}",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+
+                  if allocated_ids:
+                      gpu_id_override = ",".join(str(g) for g in allocated_ids)
+
+              local_path = Path.cwd().resolve() if env_opt("LOCAL") else None
+              docker_args = build_docker_args(
+                  config,
+                  job_key,
+                  repo_url,
+                  branch,
+                  stages,
+                  "/workspace",
+                  env_opt("IMAGE_TAG"),
+                  gpu_id_override=gpu_id_override,
+                  results_dir=results_dir,
+                  local_path=local_path,
+              )
+
+              docker_args_file = Path(os.environ["RUNNER_TEMP"]) / "docker_args.txt"
+              docker_args_file.write_text(shell_join(docker_args), encoding="utf-8")
+
+          image_ref = resolve_image(
+              config,
+              job.get("platform", platform),
+              env_opt("IMAGE_TAG") or job.get("image", "latest"),
+          )
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"RESULT_DIR={results_dir}\n")
+              f.write(f"IMAGE_TAG={image_ref}\n")
+              if not uses_local_runner:
+                  f.write(f"DOCKER_ARGS_FILE={docker_args_file}\n")
+          PY
+
+      - name: Run local Unit Test with host device lease
+        if: ${{ matrix.execution_mode == 'agent_local' }}
+        working-directory: repo
+        env:
+          ${{ matrix.job_env }}
+        run: |
+          set -euo pipefail
+          echo "==> running job: ${{ matrix.job_name }}"
+
+          if [ -n "${RESULT_DIR:-}" ] && [ "${RESULT_DIR}" != "None" ]; then
+            mkdir -p "${RESULT_DIR}"
+          fi
+
+          echo "**************************************************************************************"
+          echo "${{ matrix.platform }}"
+          echo "Unit"
+          echo "InfiniTensor"
+          echo ".ci/run.py --job ${{ matrix.id }}"
+          echo "${{ github.run_id }}"
+          echo "${IMAGE_TAG}"
+          echo "**************************************************************************************"
+
+          PYTHONDONTWRITEBYTECODE=1 python3 .ci/run.py \
+            --config "${{ inputs.config_path }}" \
+            --job "${{ matrix.id }}" \
+            --local \
+            --image-tag "${IMAGE_TAG_VALUE}" \
+            --results-dir "${RESULT_DIR}"
+
+      - name: Trigger ${{ matrix.platform }} Unit Test Task
+        if: ${{ matrix.execution_mode != 'agent_local' }}
+        working-directory: repo
+        env:
+          ${{ matrix.job_env }}
+        run: |
+          set -e
+          DOCKER_ARGS="$(cat "${DOCKER_ARGS_FILE}")"
+          echo "==> running job: ${{ matrix.job_name }}"
+          set -m
+
+          if [ -n "${RESULT_DIR:-}" ] && [ "${RESULT_DIR}" != "None" ]; then
+            mkdir -p "${RESULT_DIR}"
+          fi
+
+          src_dir=$(pwd)
+          echo "src_dir: ${src_dir}"
+
+          cd /data-aisoft/artifacts
+          if [ ! -d "CI_${{ matrix.platform }}_test" ]; then
+            mkdir -p "CI_${{ matrix.platform }}_test"
+          fi
+          cd CI_${{ matrix.platform }}_test
+          mkdir -p ${{ github.run_id }}_${{ matrix.id }}
+          cd ${{ github.run_id }}_${{ matrix.id }}
+
+          cp "${src_dir}/.ci/daemon.sh" .
+          chmod a+x ./daemon.sh
+
+          PLATFORM=${{ matrix.platform }}
+          echo "**************************************************************************************"
+          echo "${PLATFORM^}"
+          echo "Unit"
+          echo "InfiniTensor"
+          echo "${DOCKER_ARGS}"
+          echo "${{ github.run_id }}"
+          echo "${IMAGE_TAG}"
+          echo "**************************************************************************************"
+
+          export CI_REF="${{ inputs.ci_ref }}"
+          export CI_SOURCE_DIR="${src_dir}"
+          exec ./daemon.sh \
+            "${PLATFORM^}" \
+            "Unit" \
+            "InfiniTensor" \
+            "None" \
+            "${DOCKER_ARGS}" \
+            ${{ github.run_id }} \
+            "${IMAGE_TAG}"

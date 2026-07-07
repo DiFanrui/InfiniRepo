@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""Resource detection and allocation for CI Runner Agent."""
+
+from __future__ import annotations
+
+import json
+import operator
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import fcntl
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO
+
+# GPU passthrough styles
+GPU_STYLE_NVIDIA = "nvidia"
+GPU_STYLE_NONE = "none"
+GPU_STYLE_MLU = "mlu"
+
+# Platform-to-device-env mapping for non-NVIDIA platforms.
+# NVIDIA uses Docker's --gpus flag instead of an environment variable.
+PLATFORM_DEVICE_ENV = {
+    "iluvatar": "CUDA_VISIBLE_DEVICES",
+    "metax": "CUDA_VISIBLE_DEVICES",
+    "moore": "MTHREADS_VISIBLE_DEVICES",
+    "cambricon": "MLU_VISIBLE_DEVICES",
+    "ascend": "ASCEND_VISIBLE_DEVICES",
+}
+
+PROCESS_EXCLUSIVE_PLATFORMS = {"ascend", "iluvatar"}
+RESOURCE_LOCK_DIR_ENV = "CI_RESOURCE_LOCK_DIR"
+DEFAULT_RESOURCE_LOCK_DIR = Path("/tmp/infinitensor-ci-resource-locks")
+
+
+@dataclass
+class GpuInfo:
+    index: int
+    memory_used_mb: float
+    memory_total_mb: float
+    utilization_pct: float
+    process_count: int = 0
+    process_pids: tuple[int, ...] = ()
+
+
+@dataclass
+class SystemResources:
+    total_memory_mb: float
+    available_memory_mb: float
+    cpu_count: int
+
+
+@dataclass
+class DeviceLease:
+    """Host-level device lease backed by open file locks."""
+
+    platform: str
+    device_ids: list[int]
+    _files: list[TextIO]
+    _released: bool = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+    def release(self):
+        """Release all device locks held by this lease."""
+        if self._released:
+            return
+
+        for f in self._files:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
+
+        self._released = True
+
+
+class DeviceLeaseManager:
+    """Acquire cross-process host device leases for CI jobs."""
+
+    def __init__(self, platform, lock_dir=None, utilization_threshold=10, pool=None):
+        self._platform = platform
+        self._lock_dir = self._resolve_lock_dir(lock_dir)
+        self._pool = pool or ResourcePool(platform, utilization_threshold)
+
+    @property
+    def lock_dir(self):
+        return self._lock_dir
+
+    def _resolve_lock_dir(self, lock_dir=None):
+        configured = lock_dir or os.environ.get(RESOURCE_LOCK_DIR_ENV)
+        if configured:
+            return Path(configured)
+
+        try:
+            DEFAULT_RESOURCE_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+            probe = DEFAULT_RESOURCE_LOCK_DIR / ".write-test"
+            with probe.open("a", encoding="utf-8"):
+                pass
+            probe.unlink(missing_ok=True)
+            return DEFAULT_RESOURCE_LOCK_DIR
+        except OSError:
+            return Path(f"{DEFAULT_RESOURCE_LOCK_DIR}-{os.getuid()}")
+
+    def acquire(
+        self,
+        gpu_count,
+        memory_mb=0,
+        requested_ids=None,
+        timeout=0,
+        poll_interval=5.0,
+        metadata=None,
+    ) -> DeviceLease | None:
+        """Acquire a lease for available devices.
+
+        The returned lease must be held for the full container lifetime.
+        """
+        requested_ids = list(requested_ids or [])
+        gpu_count = len(requested_ids) if requested_ids else int(gpu_count)
+
+        if gpu_count <= 0:
+            if memory_mb > 0:
+                sys_res = self._pool.detect_system_resources()
+
+                if sys_res.available_memory_mb < memory_mb:
+                    return None
+
+            return DeviceLease(self._platform, [], [])
+
+        deadline = (
+            None if timeout is None else time.monotonic() + max(float(timeout), 0)
+        )
+
+        while True:
+            lease = self._try_acquire(gpu_count, memory_mb, requested_ids, metadata)
+
+            if lease is not None:
+                return lease
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+
+            sleep_for = poll_interval
+
+            if deadline is not None:
+                sleep_for = min(sleep_for, max(deadline - time.monotonic(), 0))
+
+            if sleep_for <= 0:
+                return None
+
+            time.sleep(sleep_for)
+
+    def _try_acquire(
+        self, gpu_count, memory_mb, requested_ids, metadata
+    ) -> DeviceLease | None:
+        self._lock_dir.mkdir(parents=True, exist_ok=True)
+        allocate_lock = self._lock_dir / f"{self._platform}.allocate.lock"
+
+        with allocate_lock.open("a+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._try_acquire_locked(
+                    gpu_count, memory_mb, requested_ids, metadata
+                )
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _try_acquire_locked(
+        self, gpu_count, memory_mb, requested_ids, metadata
+    ) -> DeviceLease | None:
+        gpus = self._pool.detect_gpus()
+        sys_res = self._pool.detect_system_resources() if memory_mb > 0 else None
+
+        if sys_res is not None and sys_res.available_memory_mb < memory_mb:
+            return None
+
+        available = [g for g in gpus if self._is_eligible(g)]
+
+        if requested_ids and not gpus:
+            return self._try_acquire_requested_ids_without_probe(
+                requested_ids, metadata
+            )
+
+        if requested_ids:
+            by_index = {g.index: g for g in available}
+            candidates = []
+
+            for idx in requested_ids:
+                if idx not in by_index:
+                    return None
+
+                candidates.append(by_index[idx])
+        else:
+            candidates = sorted(
+                available,
+                key=operator.attrgetter("utilization_pct", "memory_used_mb", "index"),
+            )
+
+        locked_files: list[TextIO] = []
+        selected: list[int] = []
+
+        try:
+            for gpu in candidates:
+                lock_file = self._lock_dir / f"{self._platform}.device.{gpu.index}.lock"
+                lock_file.parent.mkdir(parents=True, exist_ok=True)
+                lf = lock_file.open("a+", encoding="utf-8")
+
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lf.close()
+                    if requested_ids:
+                        return None
+                    continue
+
+                self._write_lock_metadata(lf, gpu.index, metadata)
+                locked_files.append(lf)
+                selected.append(gpu.index)
+
+                if len(selected) == gpu_count:
+                    return DeviceLease(self._platform, selected, locked_files)
+
+            return None
+        finally:
+            if len(selected) < gpu_count:
+                for lf in locked_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lf.close()
+
+    def _try_acquire_requested_ids_without_probe(
+        self, requested_ids, metadata
+    ) -> DeviceLease | None:
+        locked_files: list[TextIO] = []
+
+        try:
+            for idx in requested_ids:
+                lock_file = self._lock_dir / f"{self._platform}.device.{idx}.lock"
+                lock_file.parent.mkdir(parents=True, exist_ok=True)
+                lf = lock_file.open("a+", encoding="utf-8")
+
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lf.close()
+                    return None
+
+                self._write_lock_metadata(lf, idx, metadata)
+                locked_files.append(lf)
+
+            return DeviceLease(self._platform, list(requested_ids), locked_files)
+        finally:
+            if len(locked_files) < len(requested_ids):
+                for lf in locked_files:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lf.close()
+
+    def _is_eligible(self, gpu: GpuInfo) -> bool:
+        return (
+            self._pool._is_gpu_memory_available(gpu)
+            and gpu.utilization_pct < self._pool._utilization_threshold
+            and (
+                self._platform not in PROCESS_EXCLUSIVE_PLATFORMS
+                or gpu.process_count == 0
+            )
+        )
+
+    def _write_lock_metadata(self, f: TextIO, device_id, metadata):
+        payload = {
+            "platform": self._platform,
+            "device": device_id,
+            "pid": os.getpid(),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **(metadata or {}),
+        }
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+        f.flush()
+
+
+class ResourcePool:
+    """Thread-safe GPU and system resource manager.
+
+    Detects available GPUs via platform-specific tools (nvidia-smi, ixsmi, mx-smi, mthreads-gmi)
+    and tracks allocations to enable dynamic parallel scheduling.
+    """
+
+    GPU_QUERY_TOOLS = {
+        "nvidia": "nvidia-smi",
+        "iluvatar": "ixsmi",
+        "metax": "mx-smi",
+        "moore": "mthreads-gmi",
+        "cambricon": "cnmon",
+        "ascend": "npu-smi",
+    }
+
+    def __init__(self, platform, utilization_threshold=10):
+        self._platform = platform
+        self._utilization_threshold = utilization_threshold
+        self._allocated: set[int] = set()
+        self._lock = threading.Lock()
+
+    @property
+    def platform(self):
+        return self._platform
+
+    @property
+    def allocated(self):
+        with self._lock:
+            return set(self._allocated)
+
+    def detect_gpus(self) -> list[GpuInfo]:
+        """Query GPU status via platform-specific CLI tool."""
+        if self._platform == "metax":
+            return self._detect_gpus_metax()
+
+        if self._platform == "moore":
+            return self._detect_gpus_moore()
+
+        if self._platform == "cambricon":
+            return self._detect_gpus_cambricon()
+
+        if self._platform == "iluvatar":
+            return self._detect_gpus_iluvatar()
+
+        if self._platform == "ascend":
+            return self._detect_gpus_ascend()
+
+        tool = self.GPU_QUERY_TOOLS.get(self._platform)
+
+        return self._detect_gpus_csv(tool)
+
+    def _detect_gpus_csv(self, tool) -> list[GpuInfo]:
+        if not tool:
+            return []
+
+        try:
+            result = subprocess.run(
+                [
+                    tool,
+                    "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0:
+            return []
+
+        gpus = []
+
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+
+            if len(parts) < 4:
+                continue
+
+            try:
+                gpus.append(
+                    GpuInfo(
+                        index=int(parts[0]),
+                        memory_used_mb=float(parts[1]),
+                        memory_total_mb=float(parts[2]),
+                        utilization_pct=float(parts[3]),
+                    )
+                )
+            except (ValueError, IndexError):
+                continue
+
+        return gpus
+
+    def _detect_gpus_iluvatar(self) -> list[GpuInfo]:
+        tool = self.GPU_QUERY_TOOLS.get("iluvatar")
+        if not tool:
+            return []
+
+        gpus = self._detect_gpus_csv(tool)
+
+        if not gpus:
+            return []
+
+        try:
+            raw_result = subprocess.run(
+                [tool],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return gpus
+
+        if raw_result.returncode != 0:
+            return gpus
+
+        process_pids: dict[int, list[int]] = {}
+        in_process_table = False
+
+        for line in raw_result.stdout.splitlines():
+            if "Processes:" in line:
+                in_process_table = True
+                continue
+
+            if not in_process_table:
+                continue
+
+            content = line.strip().strip("|").strip()
+            tokens = content.split()
+
+            if len(tokens) < 2 or not tokens[0].isdigit() or not tokens[1].isdigit():
+                continue
+
+            try:
+                gpu_index = int(tokens[0])
+                pid = int(tokens[1])
+            except ValueError:
+                continue
+
+            process_pids.setdefault(gpu_index, []).append(pid)
+
+        return [
+            GpuInfo(
+                index=g.index,
+                memory_used_mb=g.memory_used_mb,
+                memory_total_mb=g.memory_total_mb,
+                utilization_pct=g.utilization_pct,
+                process_count=len(process_pids.get(g.index, [])),
+                process_pids=tuple(process_pids.get(g.index, ())),
+            )
+            for g in gpus
+        ]
+
+    def _detect_gpus_metax(self) -> list[GpuInfo]:
+        """Parse mx-smi output for MetaX GPUs.
+
+        Runs --show-memory and --show-usage separately and merges results.
+        Output format example:
+            GPU#0  MXC550  0000:1a:00.0
+                Memory
+                    vis_vram total  : 67108864 KB
+                    vis_vram used   : 879032 KB
+                Utilization
+                    GPU             : 0 %
+        """
+
+        def run_mxsmi(flag):
+            try:
+                r = subprocess.run(
+                    ["mx-smi", flag],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                return r.stdout if r.returncode == 0 else ""
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return ""
+
+        mem_out = run_mxsmi("--show-memory")
+        util_out = run_mxsmi("--show-usage")
+
+        # Parse memory: collect {index: (used_kb, total_kb)}
+        mem = {}
+        current = None
+        for line in mem_out.splitlines():
+            m = re.match(r"GPU#(\d+)", line.strip())
+            if m:
+                current = int(m.group(1))
+                mem[current] = [0.0, 0.0]
+                continue
+            if current is None:
+                continue
+            m = re.search(r"vis_vram total\s*:\s*([\d.]+)\s*KB", line)
+            if m:
+                mem[current][1] = float(m.group(1)) / 1024  # KB -> MB
+            m = re.search(r"vis_vram used\s*:\s*([\d.]+)\s*KB", line)
+            if m:
+                mem[current][0] = float(m.group(1)) / 1024  # KB -> MB
+
+        # Parse utilization: collect {index: utilization_pct}
+        util = {}
+        current = None
+        in_util = False
+        for line in util_out.splitlines():
+            m = re.match(r"GPU#(\d+)", line.strip())
+            if m:
+                current = int(m.group(1))
+                in_util = False
+                continue
+            if current is None:
+                continue
+            if "Utilization" in line:
+                in_util = True
+                continue
+            if in_util:
+                m = re.match(r"\s*GPU\s*:\s*([\d.]+)\s*%", line)
+                if m:
+                    util[current] = float(m.group(1))
+                    in_util = False
+
+        gpus = []
+        for idx in sorted(mem):
+            used_mb, total_mb = mem[idx]
+            gpus.append(
+                GpuInfo(
+                    index=idx,
+                    memory_used_mb=used_mb,
+                    memory_total_mb=total_mb,
+                    utilization_pct=util.get(idx, 0.0),
+                )
+            )
+        return gpus
+
+    def _detect_gpus_moore(self) -> list[GpuInfo]:
+        """Parse mthreads-gmi JSON output for Moore Threads GPUs.
+
+        Uses: mthreads-gmi -q --json
+        Expected JSON structure:
+            {
+              "Attached GPUs": {
+                "GPU 00000000:3B:00.0": {
+                  "Minor Number": "0",
+                  "Memory Usage": {
+                    "Total": "24576 MiB",
+                    "Used": "512 MiB"
+                  },
+                  "Utilization": {
+                    "Gpu": "5 %"
+                  }
+                }
+              }
+            }
+        """
+
+        def extract_number(s):
+            m = re.search(r"([\d.]+)", str(s))
+            return float(m.group(1)) if m else 0.0
+
+        try:
+            result = subprocess.run(
+                ["mthreads-gmi", "-q", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0:
+            return []
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+
+        gpus = []
+        attached = data.get("Attached GPUs", {})
+        gpu_entries = data.get("GPU")
+
+        if isinstance(gpu_entries, list):
+            iterable = gpu_entries
+        elif isinstance(attached, dict):
+            iterable = attached.values()
+        else:
+            iterable = ()
+
+        for gpu_data in iterable:
+            try:
+                index = int(
+                    gpu_data.get("Index", gpu_data.get("Minor Number", len(gpus)))
+                )
+
+                mem = gpu_data.get("FB Memory Usage", gpu_data.get("Memory Usage", {}))
+                total_mb = extract_number(mem.get("Total", "0 MiB"))
+                used_mb = extract_number(mem.get("Used", "0 MiB"))
+                util_pct = extract_number(
+                    gpu_data.get("Utilization", {}).get("Gpu", "0 %")
+                )
+
+                gpus.append(
+                    GpuInfo(
+                        index=index,
+                        memory_used_mb=used_mb,
+                        memory_total_mb=total_mb,
+                        utilization_pct=util_pct,
+                    )
+                )
+            except (ValueError, AttributeError):
+                continue
+
+        return sorted(gpus, key=operator.attrgetter("index"))
+
+    def _detect_gpus_cambricon(self) -> list[GpuInfo]:
+        """Parse cnmon output for Cambricon MLU cards.
+
+        Each card appears as two consecutive data rows:
+            Row 1: | {card}  {vf}  {name}  {fw} | {bus_id} | {util}%  {ecc} |
+            Row 2: | {fan}%  {temp}  {pwr} | {mem_used} MiB/ {mem_total} MiB | ... |
+        """
+        try:
+            result = subprocess.run(
+                ["cnmon"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0:
+            return []
+
+        gpus = []
+        lines = result.stdout.splitlines()
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            # Row 1: "| {index} ... | {bus_id} | {util}%  {ecc} |"
+            m1 = re.match(r"^\|\s+(\d+)\s+.*\|\s*([\d.]+)%", line)
+
+            if m1 and i + 1 < len(lines):
+                try:
+                    card_index = int(m1.group(1))
+                    util_pct = float(m1.group(2))
+                    row2 = lines[i + 1]
+                    mem_m = re.search(r"([\d.]+)\s+MiB/\s*([\d.]+)\s+MiB", row2)
+
+                    if mem_m:
+                        used_mb = float(mem_m.group(1))
+                        total_mb = float(mem_m.group(2))
+                    else:
+                        used_mb, total_mb = 0.0, 0.0
+
+                    gpus.append(
+                        GpuInfo(
+                            index=card_index,
+                            memory_used_mb=used_mb,
+                            memory_total_mb=total_mb,
+                            utilization_pct=util_pct,
+                        )
+                    )
+                except (ValueError, AttributeError):
+                    pass
+                i += 2
+                continue
+
+            i += 1
+
+        return sorted(gpus, key=operator.attrgetter("index"))
+
+    def _detect_gpus_ascend(self) -> list[GpuInfo]:
+        """Parse npu-smi info output for Huawei Ascend NPUs."""
+        try:
+            result = subprocess.run(
+                ["npu-smi", "info"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0:
+            return []
+
+        gpus = []
+        lines = result.stdout.splitlines()
+        process_pids: dict[int, list[int]] = {}
+
+        for line in lines:
+            process_m = re.match(r"^\|\s*(\d+)\s+\d+\s*\|\s*(\d+)\s*\|", line)
+
+            if not process_m:
+                continue
+
+            try:
+                npu_index = int(process_m.group(1))
+                pid = int(process_m.group(2))
+            except ValueError:
+                continue
+
+            process_pids.setdefault(npu_index, []).append(pid)
+
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            if "Process id" in line and "Process name" in line:
+                break
+
+            m1 = re.match(r"^\|\s+(\d+)\s+", line)
+
+            if m1 and i + 1 < len(lines) and re.search(r"\b(910|310)\w*\b", line):
+                try:
+                    npu_index = int(m1.group(1))
+                    row2 = lines[i + 1]
+                    aicore_m = re.match(
+                        r"^\|\s+\d+\s+\|\s+[\da-f:.]+\s+\|\s*([\d.]+)\s",
+                        row2,
+                    )
+                    util_pct = float(aicore_m.group(1)) if aicore_m else 0.0
+
+                    # Row 2 contains DDR and HBM pairs; HBM is the final pair.
+                    hbm_matches = re.findall(r"([\d.]+)\s*/\s*([\d.]+)", row2)
+
+                    if hbm_matches:
+                        used_mb = float(hbm_matches[-1][0])
+                        total_mb = float(hbm_matches[-1][1])
+                    else:
+                        used_mb, total_mb = 0.0, 0.0
+
+                    gpus.append(
+                        GpuInfo(
+                            index=npu_index,
+                            memory_used_mb=used_mb,
+                            memory_total_mb=total_mb,
+                            utilization_pct=util_pct,
+                            process_count=len(process_pids.get(npu_index, [])),
+                            process_pids=tuple(process_pids.get(npu_index, ())),
+                        )
+                    )
+                except (ValueError, AttributeError):
+                    pass
+
+                i += 2
+                continue
+
+            i += 1
+
+        return sorted(gpus, key=operator.attrgetter("index"))
+
+    def detect_system_resources(self) -> SystemResources:
+        """Read system memory from /proc/meminfo and CPU count."""
+        total_mb = 0.0
+        available_mb = 0.0
+
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total_mb = float(line.split()[1]) / 1024
+                    elif line.startswith("MemAvailable:"):
+                        available_mb = float(line.split()[1]) / 1024
+        except OSError:
+            pass
+
+        return SystemResources(
+            total_memory_mb=total_mb,
+            available_memory_mb=available_mb,
+            cpu_count=os.cpu_count() or 1,
+        )
+
+    def get_free_gpus(self) -> list[int]:
+        """Return GPU indices with utilization below threshold."""
+        gpus = self.detect_gpus()
+        return [
+            g.index
+            for g in gpus
+            if g.utilization_pct < self._utilization_threshold
+            and (
+                self._platform not in PROCESS_EXCLUSIVE_PLATFORMS
+                or g.process_count == 0
+            )
+        ]
+
+    def allocate(self, gpu_count, memory_mb=0) -> tuple[list[int], bool]:
+        """Try to allocate GPUs and check memory.
+
+        Returns (allocated_gpu_ids, success). On failure returns ([], False).
+        GPU detection and memory checks run outside the lock to avoid blocking
+        other threads while subprocess.run (nvidia-smi) executes.
+        """
+        if gpu_count <= 0:
+            if memory_mb > 0:
+                sys_res = self.detect_system_resources()
+
+                if sys_res.available_memory_mb < memory_mb:
+                    return ([], False)
+
+            return ([], True)
+
+        # Detect GPUs and memory outside the lock (subprocess.run can block)
+        gpus = self.detect_gpus()
+        sys_res = self.detect_system_resources() if memory_mb > 0 else None
+
+        with self._lock:
+            available = [
+                g
+                for g in gpus
+                if g.index not in self._allocated
+                and self._is_gpu_memory_available(g)
+                and g.utilization_pct < self._utilization_threshold
+                and (
+                    self._platform not in PROCESS_EXCLUSIVE_PLATFORMS
+                    or g.process_count == 0
+                )
+            ]
+
+            if len(available) < gpu_count:
+                return ([], False)
+
+            if sys_res is not None and sys_res.available_memory_mb < memory_mb:
+                return ([], False)
+
+            if self._platform in PROCESS_EXCLUSIVE_PLATFORMS:
+                available.sort(
+                    key=operator.attrgetter(
+                        "utilization_pct", "memory_used_mb", "index"
+                    )
+                )
+            else:
+                available.sort(key=operator.attrgetter("utilization_pct"))
+            selected = [g.index for g in available[:gpu_count]]
+            self._allocated.update(selected)
+            return (selected, True)
+
+    def _is_gpu_memory_available(self, gpu: GpuInfo) -> bool:
+        if self._platform in {"ascend", "iluvatar"} and gpu.memory_total_mb > 0:
+            return (gpu.memory_total_mb - gpu.memory_used_mb) > 1024
+
+        if self._platform == "metax":
+            return gpu.memory_used_mb < 2048
+
+        return gpu.memory_used_mb < 100
+
+    def release(self, gpu_ids):
+        """Return GPUs to the free pool."""
+        with self._lock:
+            self._allocated -= set(gpu_ids)
+
+    def get_status(self) -> dict:
+        """Return current resource status for API endpoints."""
+        gpus = self.detect_gpus()
+        sys_res = self.detect_system_resources()
+
+        with self._lock:
+            allocated = sorted(self._allocated)
+
+        return {
+            "platform": self._platform,
+            "gpus": [
+                {
+                    "index": g.index,
+                    "memory_used_mb": g.memory_used_mb,
+                    "memory_total_mb": g.memory_total_mb,
+                    "utilization_pct": g.utilization_pct,
+                    "process_count": g.process_count,
+                    "process_pids": list(g.process_pids),
+                    "allocated_by_agent": g.index in allocated,
+                }
+                for g in gpus
+            ],
+            "allocated_gpu_ids": allocated,
+            "system": {
+                "total_memory_mb": round(sys_res.total_memory_mb, 1),
+                "available_memory_mb": round(sys_res.available_memory_mb, 1),
+                "cpu_count": sys_res.cpu_count,
+            },
+            "utilization_threshold": self._utilization_threshold,
+        }
+
+
+def parse_gpu_requirement(job_config) -> int:
+    """Extract GPU count requirement from a job config."""
+    resources = job_config.get("resources", {})
+    gpu_ids = str(resources.get("gpu_ids", "auto")).strip()
+    ngpus = resources.get("ngpus")
+
+    if gpu_ids == "all":
+        return 0
+
+    if gpu_ids == "auto" or not gpu_ids:
+        return int(ngpus) if ngpus is not None else 1
+
+    count = len(gpu_ids.split(","))
+
+    if ngpus is not None and int(ngpus) != count:
+        print(
+            f"warning: gpu_ids has {count} device(s) but ngpus={ngpus}; "
+            f"using gpu_ids count ({count})",
+            file=sys.stderr,
+        )
+
+    return count
+
+
+def parse_memory_requirement(job_config) -> float:
+    """Extract memory requirement in MB from a job config."""
+    resources = job_config.get("resources", {})
+    memory = str(resources.get("memory", ""))
+
+    if not memory:
+        return 0
+
+    memory = memory.lower().strip()
+
+    if memory.endswith("gb"):
+        return float(memory[:-2]) * 1024
+    elif memory.endswith("g"):
+        return float(memory[:-1]) * 1024
+    elif memory.endswith("mb"):
+        return float(memory[:-2])
+    elif memory.endswith("m"):
+        return float(memory[:-1])
+
+    try:
+        return float(memory) * 1024  # Default: GB
+    except ValueError:
+        print(
+            f"warning: unrecognized memory format {memory!r}, treating as 0",
+            file=sys.stderr,
+        )
+        return 0
+
+
+def detect_platform():
+    """Auto-detect the current platform by probing GPU query tools on PATH."""
+    for platform, tool in ResourcePool.GPU_QUERY_TOOLS.items():
+        if shutil.which(tool):
+            return platform
+
+    return None

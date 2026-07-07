@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -m
+
+cleanup() {
+    trap - SIGINT SIGTERM SIGHUP SIGPIPE
+    echo "Stopping CI test job..."
+    stop_ci_containers
+    # docker kill --signal=SIGTERM CI_test_job_${CI_job_id}
+    # docker kill -s TERM CI_test_job_${CI_job_id}
+    # rm -rf $curr_dir
+    exit 130
+}
+
+trap cleanup SIGINT SIGTERM SIGHUP SIGPIPE
+
+platform=$1
+test_type=$2
+engine=$3
+model_list=$4
+docker_args="$5"
+CI_job_id=$6
+
+if [ "$test_type" == "Performance" ]; then
+    test_param=$7
+    version=$8
+else
+    test_param=""
+    version=$7
+fi
+
+curr_dir=$(pwd)
+ci_ref=${CI_REF:-master}
+platform_suite=$(echo "$platform" | tr '[:upper:]' '[:lower:]')
+source_ci_dir=${CI_SOURCE_DIR:-}
+source_mount_args=()
+docker_cli_mount_args=()
+
+stop_ci_containers() {
+    local names=()
+    local name
+
+    while IFS= read -r name; do
+        names+=("$name")
+    done < <(
+        docker ps -a --format '{{.Names}}' | grep -E \
+            "^(CI_test_job_${platform}_${test_type}_${CI_job_id}|infiniTensor_${platform_suite}_${test_type}Test_${CI_job_id}(_|$))" || true
+    )
+
+    for name in "${names[@]}"; do
+        docker stop --time 60 "$name" 2>/dev/null || docker stop "$name" 2>/dev/null || true
+        docker rm -f "$name" 2>/dev/null || true
+    done
+}
+
+if [ -n "$source_ci_dir" ] && [ -d "${source_ci_dir}/.ci" ]; then
+    source_mount_args=(-v "${source_ci_dir}/.ci:/CI_Source/ci:ro")
+fi
+
+if [ -x /usr/bin/docker ]; then
+    docker_cli_mount_args=(-v /usr/bin/docker:/usr/bin/docker:ro)
+
+    if [ -e /usr/lib64/libltdl.so.7 ]; then
+        docker_cli_mount_args+=(-v /usr/lib64/libltdl.so.7:/usr/lib64/libltdl.so.7:ro)
+    fi
+fi
+
+echo "Using CI ref: ${ci_ref}"
+echo "Using scheduler suite: ${platform_suite}_test_suite"
+if [ ${#source_mount_args[@]} -gt 0 ]; then
+    echo "Using CI source: ${source_ci_dir}/.ci"
+fi
+if [ ${#docker_cli_mount_args[@]} -gt 0 ]; then
+    echo "Using host Docker CLI"
+fi
+
+container_script='
+set -euo pipefail
+
+
+mkdir -p ~/.ssh
+if [ -d /CI_Host_SSH ]; then
+    cp -LR /CI_Host_SSH/. ~/.ssh/
+fi
+chmod 700 ~/.ssh
+find ~/.ssh -type f -name "id_*" -exec chmod 600 {} +
+cat > ~/.ssh/config <<EOF
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+EOF
+chmod 600 ~/.ssh/config
+
+if [ -d /CI_Source/ci/third-party/scheduler ]; then
+    worktree="/CI_Workspace/ci_autotest_${6}_${CI_PLATFORM_SUITE}_${2}_$$"
+    rm -rf "${worktree}"
+    cp -a /CI_Source/ci "${worktree}"
+    cd "${worktree}"
+else
+    cd /CI_Workspace
+    if [ ! -d ci_autotest/.git ]; then
+        git clone git@github.com:InfiniTensor/ci.git ci_autotest
+    fi
+
+    cd ci_autotest
+    if git fetch origin "${CI_REF}"; then
+        git checkout -f --detach FETCH_HEAD
+    else
+        echo "Warning: failed to fetch ${CI_REF}; using existing ci_autotest checkout"
+    fi
+fi
+
+cd "third-party/scheduler/${CI_PLATFORM_SUITE}_test_suite"
+if [ "$2" = "Performance" ]; then
+    version="${8:-}"
+else
+    version="${7:-}"
+fi
+
+mkdir -p "${version}"
+cp latest/model_list.yml "${version}"
+version_tag="${version##*:}"
+if [ "${version_tag}" != "${version}" ]; then
+    mkdir -p "${version_tag}"
+    cp latest/model_list.yml "${version_tag}"
+fi
+
+if [ "$2" = "Performance" ]; then
+    exec "./${CI_PLATFORM_SUITE}_resource_monitor.sh" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+else
+    exec "./${CI_PLATFORM_SUITE}_resource_monitor.sh" "$2" "$3" "$4" "$5" "$6" "$7"
+fi
+'
+
+docker_args_list=(
+    --rm
+    --runtime runc
+    --name="CI_test_job_${platform}_${test_type}_${CI_job_id}"
+    --ipc=host
+    --net=host
+    --privileged
+    -v /home/zkjh/.npu_locks:/home/zkjh/.npu_locks
+    -v /data/shared/limingge/CI_Workspace:/CI_Workspace
+    -v /data-aisoft/artifacts:/artifacts
+    -v "${HOME}/.ssh:/CI_Host_SSH:ro"
+    -v /var/run/docker.sock:/var/run/docker.sock
+    "${source_mount_args[@]}"
+    "${docker_cli_mount_args[@]}"
+    -e "CI_REF=${ci_ref}"
+    -e "CI_PLATFORM_SUITE=${platform_suite}"
+    -e HTTP_PROXY
+    -e HTTPS_PROXY
+    -e http_proxy
+    -e https_proxy
+    -e NO_PROXY
+    -e no_proxy
+    --entrypoint /bin/bash
+    auto-test:latest
+    -lc
+    "${container_script}"
+    bash
+    "$platform"
+    "$test_type"
+    "$engine"
+    "$model_list"
+    "$docker_args"
+    "$CI_job_id"
+)
+
+if [ "$test_type" == "Performance" ]; then
+    docker_args_list+=("$test_param" "$version")
+else
+    docker_args_list+=("$version")
+fi
+
+docker run "${docker_args_list[@]}" &
+CHILD_PID=$!
+
+echo -n "Running"
+while kill -0 $CHILD_PID 2>/dev/null; do
+    # echo -ne "\r\033[KRunning..."
+    echo -n "."
+    sleep 1
+done
+
+wait $CHILD_PID
+EXIT_CODE=$?
+
+stop_ci_containers
+
+# rm -rf $curr_dir
+
+exit $EXIT_CODE

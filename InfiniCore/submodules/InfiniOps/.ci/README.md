@@ -1,0 +1,161 @@
+# .ci - CI Images and Pipeline
+
+This directory contains reusable CI tooling: Docker image builder, local runner
+helpers, GitHub Actions matrix converter, reusable workflow, and tests.
+
+```
+.ci/
+├── config.yml
+├── build.py
+├── run.py
+├── ci_resource.py
+├── daemon.sh
+├── config_to_matrix.py
+├── .github/
+│   └── workflows/
+│       └── infiniops-ci.yml
+├── images/
+│   ├── nvidia/
+│   ├── iluvatar/
+│   ├── metax/
+│   ├── moore/
+│   ├── cambricon/
+│   └── ascend/
+└── tests/
+```
+
+Prerequisites: Docker, Python 3.10+, and `pip install pyyaml`.
+
+## Configuration
+
+For repository CI, the caller repository owns the project config, usually at
+`.github/ci_config.yml`. The bundled `config.yml` is kept as a local example
+and test fixture.
+
+The config uses a platform-centric structure. `utils.normalize_config()` flattens
+each platform job to `{platform}_{job}`, for example `nvidia_gpu`.
+
+Important resource fields:
+
+| Field | Description |
+|---|---|
+| `resources.ngpus` | Number of devices to reserve when `gpu_ids` is `auto` or omitted |
+| `resources.gpu_ids` | `auto`, `all`, or static IDs such as `"0"` / `"0,2"` |
+| `resources.gpu_style` | Docker device style: `nvidia`, `none`, or `mlu` |
+| `resources.memory` | Container memory limit |
+| `resources.shm_size` | Docker `--shm-size` |
+| `resources.timeout` | Stage timeout in seconds |
+
+Platform device visibility is handled by `ci_resource.PLATFORM_DEVICE_ENV`:
+
+| Platform | Detection tool | Device exposure |
+|---|---|---|
+| `nvidia` | `nvidia-smi` | Docker `--gpus` |
+| `iluvatar` | `ixsmi` | `CUDA_VISIBLE_DEVICES` |
+| `metax` | `mx-smi` | `CUDA_VISIBLE_DEVICES` |
+| `moore` | `mthreads-gmi` | `MTHREADS_VISIBLE_DEVICES` |
+| `cambricon` | `cnmon` | `MLU_VISIBLE_DEVICES` |
+| `ascend` | `npu-smi` | `ASCEND_VISIBLE_DEVICES` |
+
+## Image Builder
+
+```bash
+python .ci/build.py --platform nvidia
+python .ci/build.py --platform metax --force
+python .ci/build.py --platform all --dry-run
+```
+
+Supported platforms are `nvidia`, `iluvatar`, `metax`, `moore`, `cambricon`,
+`ascend`, and `all`. Image tags default to `infiniops-ci/<platform>:<commit>`
+and `infiniops-ci/<platform>:latest` unless a registry is configured.
+
+Reusable CI workflows use content-based tags for test images:
+`infiniops-ci/<platform>:df-<hash>`. The hash is derived from the platform
+Dockerfile directory and image build configuration, so jobs reuse the same local
+image while those inputs stay unchanged. When the same tag already exists on a
+self-hosted runner, `build.py --tag-mode content --reuse-existing --force`
+skips `docker build` and retags it as `latest`.
+
+## Local Runner
+
+```bash
+python .ci/run.py
+python .ci/run.py --job gpu --stage test --dry-run
+python .ci/run.py --job nvidia_gpu --gpu-id 0 --local
+python .ci/run.py --test tests/test_gemm.py::test_gemm
+```
+
+`run.py` detects the current platform from the vendor CLI on `PATH`, resolves
+matching jobs, allocates GPUs for `gpu_ids: auto`, builds Docker arguments, and
+runs the configured stages. With `--local`, the current checkout is mounted
+read-only and copied into the container before setup.
+
+Device allocation is protected by host-level lease files so parallel runner
+processes do not assign the same device at the same time. Set
+`CI_RESOURCE_LOCK_DIR` or pass `--resource-lock-dir` to choose the shared lock
+directory. If neither is set, `/tmp/infinitensor-ci-resource-locks` is used.
+The lease is held until the Docker container exits. Static `--gpu-id` and
+`resources.gpu_ids` selections also acquire the corresponding device leases.
+
+## Reusable GitHub Actions
+
+Caller repositories should keep a thin workflow:
+
+```yaml
+jobs:
+  ci:
+    uses: InfiniTensor/ci/.github/workflows/infiniops-ci.yml@codex/prune-unused-ci-artifacts
+    with:
+      config_path: .github/ci_config.yml
+      ci_ref: codex/prune-unused-ci-artifacts
+    secrets: inherit
+```
+
+The reusable workflow checks out the caller repository, replaces any caller
+`.ci` placeholder with the selected `InfiniTensor/ci` ref, converts the caller
+config to matrices, and runs unit/smoke/performance jobs.
+
+## CI v2 Shadow Agent
+
+The v2 shadow workflow uses a local, file-backed agent on each self-hosted
+hardware runner. GitHub Actions remains the control plane: it builds the image,
+submits a platform job through the local CLI, waits for completion, and uploads
+the collected artifacts.
+
+Minimal runner setup:
+
+```bash
+sudo .ci/scripts/install_ci_agent.sh
+```
+
+By default the installer copies `.ci` to `/opt/infinitensor-ci`, creates the
+`ci-agent` group, runs the daemon as `CI_AGENT_RUNNER_USER` (or the current sudo
+user), initializes `/var/lib/ci-agent`, grants the runner user access to the
+state directory, and enables the `ci-agent` systemd service. Set
+`CI_AGENT_RUNNER_USER` when the GitHub runner runs as a different user.
+
+The GitHub job calls these local commands:
+
+```bash
+python3 .ci/ci_agent.py submit ...
+python3 .ci/ci_agent.py wait <task-id>
+python3 .ci/ci_agent.py collect <task-id> --output-dir <path>
+python3 .ci/ci_agent.py cancel <task-id>
+```
+
+Task state is stored under `/var/lib/ci-agent` by default. The agent uses JSON
+task files, atomic writes, and per-platform task lock files. Device exclusivity
+is handled by the shared resource lease directory described above. If resources
+are busy, the task waits up to `resources.queue_timeout` seconds before it is
+marked as `resource_timeout`. A job passes only when the command exits with code
+0 and the configured JUnit XML exists with no failures or errors.
+
+## Validation
+
+Run these from `.ci/` after changes:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 config_to_matrix.py --config config.yml --dump-by-type >/tmp/ci-matrix.json
+bash -n daemon.sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests -q
+```
