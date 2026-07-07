@@ -1,6 +1,6 @@
-# InfiniLM 优化项目
+# InfiniLM 个人优化项目
 
-T2-1-2 服务能力优化 — InfiniLM 推理引擎性能优化。
+赛道 T2-1-2 服务能力优化 — InfiniLM 推理引擎性能优化。
 
 ## 目录结构
 
@@ -9,11 +9,11 @@ InfiniLM/     # InfiniTensor/InfiniLM 推理引擎
 InfiniCore/   # InfiniTensor/InfiniCore C++ 核心库
 ```
 
-## 新机器快速搭建
+## 快速搭建
 
 详细步骤见 [InfiniLM/docs_extern/环境搭建指南.md](InfiniLM/docs_extern/环境搭建指南.md)
 
-### 30 秒速览
+### 速览
 
 ```bash
 # 1. 确认 CUDA 版本匹配
