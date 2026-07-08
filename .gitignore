@@ -69,6 +69,7 @@ InfiniCore/third_party/mate/
 .DS_Store
 Thumbs.db
 /tmp/
+InfiniLM/tmp/
 *.log
 
 # ============================================================

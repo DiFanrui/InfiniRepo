@@ -114,13 +114,16 @@ KV Cache 显存 ≈ num_blocks × block_size × num_layers × 2 × num_kv_heads 
 - 32 层总计 ≈ 192 GB → **远超单卡 24GB！** 这说明参考命令里的 6144 是给多卡或更大显存的。
 - 对于 24GB RTX 4090 单卡运行 8B：权重 16GB + KV 约 6-8GB → **num-blocks 应设在 2048-4096 之间**
 
-**调优策略：**
+**实测调优（单卡 RTX 4090，24GB）：**
 
-| 场景 | block_size | num_blocks（单卡 RTX 4090） |
-|------|-----------|---------------------------|
-| 8B, 并发 4, 长序列 (4096) | 256 | 2048-3072 |
-| 8B, 并发 64, 短序列 (32-256) | 64 | 4096-8192 |
-| 8B, 并发 16, 长序列 | 128 | 3072-4096 |
+| 场景 | block_size | num_blocks | KV Cache 显存 | 说明 |
+|------|-----------|------------|--------------|------|
+| 8B, bs=1,4, 短序列 | 256 | 64 | ~2 GB | ✅ 实测稳定 |
+| 8B, bs=1,4, 长序列 (4096) | 256 | 32-48 | ~1-1.5 GB | 长序列吃 block 多，降低 num_blocks |
+| 8B, bs=16,64 | 128 | 需多卡 | — | ❌ 单卡 24GB 不够 |
+| 70B 所有场景 | 256 | 需 TP≥4 | — | ❌ 单卡跑不了 |
+
+> ⚠️ 实际测试中 `num_blocks=128` 即 OOM（显存 23.5/24GB），`num_blocks=64` 稳定运行。公式计算值与实际有差距，建议以实测为准。
 
 #### 3.2.4 批次 Token 预算（`INFINILM_MAX_NUM_BATCHED_TOKENS`）
 
@@ -349,8 +352,8 @@ Phase 6: 编译期优化
 - [x] Python 虚拟环境 (`.venv`)
 - [x] InfiniCore SDK 编译安装（CUDA 12.8 + NVIDIA GPU 后端）
 - [x] InfiniLM 编译安装
-- [ ] 8B 模型下载
-- [ ] 70B 模型下载（需额外 GPU 卡）
-- [ ] 服务器依赖（`pip install uvicorn fastapi`）
+- [x] 8B 模型下载
+- [x] 70B 模型下载（需额外 GPU 卡）
+- [x] 服务器依赖（`pip install uvicorn fastapi`）
 - [ ] Flash Attention 子模块 + 编译
-- [ ] 压测工具（`pip install vllm`）
+- [x] 压测工具（`pip install vllm`）
