@@ -11,6 +11,13 @@ infini_train_add_test(test_generator_interface
   LABELS cpu
 )
 
+# End-to-end CPU training resume test. Kept separate from the fast unit suite
+# so CI and developers can select it with the integration label.
+infini_train_add_test(test_generator_training_resume
+  SOURCES test_training_resume.cc
+  LABELS cpu integration
+)
+
 if(USE_CUDA)
   infini_train_add_test(test_generator_cuda_only
     SOURCES cuda_only/test_cuda_generator.cc

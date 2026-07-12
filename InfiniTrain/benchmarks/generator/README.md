@@ -34,6 +34,17 @@ To run only this feature's tests:
 ctest --test-dir build -R Generator --output-on-failure
 ```
 
+The end-to-end training resume test can be selected separately:
+
+```bash
+ctest --test-dir build -R GeneratorTrainingResume --output-on-failure
+```
+
+It compares uninterrupted CPU training with a checkpoint/resume path that
+restores model parameters, the stateless SGD configuration, training step, and
+Generator state. A negative control verifies that omitting Generator state
+changes the subsequent loss and parameter trajectory.
+
 ## Single benchmark
 
 ```bash
