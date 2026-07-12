@@ -5,6 +5,7 @@ option(PROFILE_MODE "ENABLE PROFILE MODE" OFF)
 option(USE_OMP "Use OpenMP as backend for Eigen" ON)
 option(USE_NCCL "Build project for distributed running" ON)
 option(BUILD_TEST "Build InfiniTrain tests" OFF)
+option(BUILD_BENCHMARK "Build InfiniTrain benchmarks" OFF)
 
 project(infini_train VERSION 0.5.0 LANGUAGES CXX)
 
@@ -211,6 +212,11 @@ link_infini_train_exe(llama3)
 # Tools
 add_subdirectory(tools/infini_run)
 set_target_properties(infini_run PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Benchmarks
+if(BUILD_BENCHMARK)
+  add_subdirectory(benchmarks)
+endif()
 
 # Tests
 if(BUILD_TEST)
