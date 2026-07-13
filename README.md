@@ -1,12 +1,14 @@
-# InfiniLM 个人优化项目
+# 个人优化项目
 
 赛道 T2-1-2 服务能力优化 — InfiniLM 推理引擎性能优化。
+赛道 T2-2-1 随机数生成器 - InfiniTrain 训练模块设计
 
 ## 目录结构
 
 ```
-InfiniLM/     # InfiniTensor/InfiniLM 推理引擎
 InfiniCore/   # InfiniTensor/InfiniCore C++ 核心库
+InfiniLM/     # InfiniTensor/InfiniLM 推理引擎
+InfiniTrain/  # InfiniTensor/InfiniTrain训练框架
 ```
 
 ## 快速搭建
@@ -83,8 +85,4 @@ git push -u origin main
 | `InfiniCore/scripts/install.py` | `run_cmd()` 加 `XMAKE_ROOT=y`；`install()` build 命令加 `-j4` |
 | `InfiniCore/setup.py` | `run_xmake_build()` 加 `XMAKE_ROOT=y` |
 
-## 相关文档
 
-- [环境搭建指南](InfiniLM/docs_extern/环境搭建指南.md) — 完整的新机器环境搭建步骤
-- [优化思路](InfiniLM/docs_extern/claude思路.md) — T2-1-2 性能优化方案分析
-- [题目](InfiniLM/docs_extern/题目.md) — 原始赛题要求
